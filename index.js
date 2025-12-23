@@ -7,121 +7,97 @@ dotenv.config();
 
 const app = express();
 
+/**
+ * IMPORTANTE:
+ * Twilio envía application/x-www-form-urlencoded
+ * Esto DEBE ir antes que express.json()
+ */
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// Inicializa Twilio client
-let client;
-try {
-  client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-  console.log("✅ Twilio client inicializado correctamente");
-} catch (e) {
-  console.error("❌ Error inicializando Twilio:", e.message);
-}
+const { MessagingResponse } = twilio.twiml;
 
-// Webhook principal para recibir mensajes
+// ==================================================
+// WEBHOOK PRINCIPAL WHATSAPP (INBOUND)
+// ==================================================
 app.post("/webhook", async (req, res) => {
-  console.log("📬 Webhook recibido");
+  console.log("==================================================");
+  console.log("📬 Webhook WhatsApp recibido");
   console.log("Headers:", req.headers);
   console.log("Body:", req.body);
 
   const incomingMsg = req.body.Body;
   const from = req.body.From;
 
+  // Respuesta por defecto (fallback seguro)
+  let reply =
+    "Hola 👋 Soy AleveLive, agencia TikTok LIVE 🎯 Escríbenos y te guiamos para comenzar.";
+
   if (!incomingMsg || !from) {
-    console.error("❌ Mensaje o número de remitente no recibido");
-    return res.sendStatus(400);
-  }
+    console.error("❌ Body inválido: falta Body o From");
+  } else {
+    console.log("📩 Mensaje recibido:", incomingMsg);
+    console.log("👤 De:", from);
 
-  console.log("📩 Mensaje recibido:", incomingMsg, "De:", from);
+    try {
+      console.log("🤖 Llamando a OpenAI...");
 
-  let reply = "Lo siento, ocurrió un error procesando tu mensaje.";
-
-  // Llamada a OpenAI
-  try {
-    const aiResponse = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-5-mini",
-        messages: [
-          {
-            role: "system",
-            content:
-              "Eres un asistente profesional, amable y claro que responde mensajes de WhatsApp. Nuestra empresa es AleveLive y el mensaje de inicio debe ser informativo sobre la agencia de AleveLive, 📌 Agencia TikTokLIVE, 🎯 Streamers y darle una bienvenida e informacion inicial en tono altamente profesional pero amigable sobre la agencia de tiktoker. Guia al usuario en todas sus preguntas, por el como comienzo, recuerda guiarlo y ser coherente con sus preguntas y respuestas. El mensaje debe ser maximo de 200 caracteres. se inteligente en tus respuestas eres asesor al cliente"
+      const aiResponse = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: "gpt-5-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Eres un asesor profesional de AleveLive, agencia TikTok LIVE. Responde claro, amable y profesional. Máximo 200 caracteres."
+            },
+            {
+              role: "user",
+              content: incomingMsg
+            }
+          ]
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            "Content-Type": "application/json"
           },
-          {
-            role: "user",
-            content: incomingMsg
-          }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json"
+          timeout: 10000 // evita que Twilio espere demasiado
         }
-      }
-    );
-    reply = aiResponse.data.choices[0]?.message?.content || reply;
-    console.log("🤖 Respuesta de GPT:", reply);
-  } catch (error) {
-    console.error("❌ Error llamando a OpenAI:", error.response?.data || error.message);
-  }
+      );
 
-  // Enviar mensaje con Twilio y log completo
-  try {
-    if (!process.env.TWILIO_WHATSAPP_NUMBER) {
-      console.error("❌ No tienes TWILIO_WHATSAPP_NUMBER configurado");
-    } else {
-      console.log("📤 Enviando mensaje a WhatsApp...");
-      const message = await client.messages.create({
-        from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`,
-        to: from,
-        body: reply,
-        statusCallback: "https://unexpeditious-ardell-moonish.ngrok-free.dev/status"
-      });
-      console.log("✅ Mensaje enviado:", message.sid);
-      console.log("Mensaje completo:", message);
+      reply =
+        aiResponse.data.choices[0]?.message?.content || reply;
+
+      console.log("🤖 Respuesta GPT:", reply);
+    } catch (error) {
+      console.error(
+        "❌ Error llamando a OpenAI:",
+        error.response?.data || error.message
+      );
     }
-  } catch (twilioError) {
-    console.error(
-      "❌ Error enviando mensaje con Twilio:",
-      twilioError.code,
-      twilioError.message,
-      twilioError.moreInfo
-    );
   }
 
-  // Responder 200 a Twilio
-  res.sendStatus(200);
+  // ==================================================
+  // RESPUESTA ÚNICA Y OFICIAL A TWILIO (TwiML)
+  // ==================================================
+  console.log("📤 Enviando respuesta TwiML a Twilio");
+
+  const twiml = new MessagingResponse();
+  twiml.message(reply);
+
+  res.status(200);
+  res.set("Content-Type", "text/xml");
+  res.send(twiml.toString());
+
+  console.log("✅ TwiML enviado correctamente");
+  console.log("==================================================");
 });
 
-// Endpoint para recibir callbacks de estado
-app.post("/status", (req, res) => {
-  const { MessageSid, MessageStatus, ErrorCode, ErrorMessage, To } = req.body;
-  
-  console.log("📊 Status Callback:");
-  console.log(`   SID: ${MessageSid}`);
-  console.log(`   Estado: ${MessageStatus}`);
-  console.log(`   Para: ${To}`);
-  
-  if (ErrorCode) {
-    console.log(`   ❌ Error ${ErrorCode}: ${ErrorMessage}`);
-  }
-  
-  // Estados posibles: queued, sent, delivered, read, failed, undelivered
-  if (MessageStatus === 'delivered') {
-    console.log("   ✅ Mensaje entregado exitosamente!");
-  } else if (MessageStatus === 'read') {
-    console.log("   👀 Mensaje leído!");
-  } else if (MessageStatus === 'failed' || MessageStatus === 'undelivered') {
-    console.log("   ❌ Mensaje NO entregado");
-  }
-  
-  res.sendStatus(200);
-});
-
-
+// ==================================================
+// SERVER
+// ==================================================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
