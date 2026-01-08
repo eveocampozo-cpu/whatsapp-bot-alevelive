@@ -1,6 +1,7 @@
 /**
  * OpenAI Service Module
  * Handles text generation, image analysis (GPT-4o Vision), and audio transcription (Whisper)
+ * Enhanced with retry logic and optimized parameters
  */
 
 import axios from "axios";
@@ -10,6 +11,47 @@ const OPENAI_BASE_URL = "https://api.openai.com/v1";
 
 // Get API key at runtime (after dotenv has loaded)
 const getApiKey = () => process.env.OPENAI_API_KEY;
+
+// Retry configuration
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 1000;
+
+/**
+ * Sleep helper for retry delays
+ * @param {number} ms - Milliseconds to sleep
+ */
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Retry wrapper with exponential backoff
+ * @param {Function} fn - Async function to retry
+ * @param {number} retries - Number of retries
+ * @param {number} delay - Base delay in ms
+ */
+async function withRetry(fn, retries = MAX_RETRIES, delay = BASE_DELAY_MS) {
+  let lastError;
+  
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      
+      // Don't retry on 4xx errors (client errors)
+      if (error.response?.status >= 400 && error.response?.status < 500) {
+        throw error;
+      }
+      
+      if (attempt < retries) {
+        const waitTime = delay * Math.pow(2, attempt - 1);
+        console.log(`⏳ Intento ${attempt}/${retries} falló. Reintentando en ${waitTime}ms...`);
+        await sleep(waitTime);
+      }
+    }
+  }
+  
+  throw lastError;
+}
 
 /**
  * Transcribe audio using OpenAI Whisper API
@@ -28,7 +70,7 @@ export async function transcribeAudio(audioBuffer, filename = "audio.ogg") {
   formData.append("model", "whisper-1");
   formData.append("language", "es"); // Spanish by default, Whisper auto-detects if needed
 
-  try {
+  return withRetry(async () => {
     const response = await axios.post(
       `${OPENAI_BASE_URL}/audio/transcriptions`,
       formData,
@@ -43,14 +85,13 @@ export async function transcribeAudio(audioBuffer, filename = "audio.ogg") {
 
     console.log("✅ Audio transcrito:", response.data.text);
     return response.data.text;
-  } catch (error) {
-    console.error("❌ Error transcribiendo audio:", error.response?.data || error.message);
-    throw new Error("No pude escuchar el audio correctamente. ¿Podrías escribirme?");
-  }
+  });
 }
 
 /**
  * Generate AI response using GPT-4o with optional image
+ * Enhanced with RAG context injection
+ * 
  * @param {Array} messages - Conversation messages array
  * @param {string|null} imageUrl - Optional Base64 image URL for vision
  * @returns {Promise<string>} AI response
@@ -78,14 +119,14 @@ export async function generateResponse(messages, imageUrl = null) {
     ];
   }
 
-  try {
+  return withRetry(async () => {
     const response = await axios.post(
       `${OPENAI_BASE_URL}/chat/completions`,
       {
         model: "gpt-4o",
         messages: messages,
-        max_tokens: 500,
-        temperature: 0.7,
+        max_tokens: 400, // Optimized for WhatsApp (1600 char limit)
+        temperature: 0.6, // Slightly lower for more consistent responses
       },
       {
         headers: {
@@ -97,12 +138,9 @@ export async function generateResponse(messages, imageUrl = null) {
     );
 
     const reply = response.data.choices[0]?.message?.content || "";
-    console.log("✅ Respuesta GPT-4o:", reply);
+    console.log("✅ Respuesta GPT-4o:", reply.substring(0, 100) + "...");
     return reply;
-  } catch (error) {
-    console.error("❌ Error generando respuesta:", error.response?.data || error.message);
-    throw new Error("Hubo un problema procesando tu mensaje. ¿Podrías intentarlo de nuevo?");
-  }
+  });
 }
 
 /**
@@ -113,7 +151,7 @@ export async function generateResponse(messages, imageUrl = null) {
 export async function analyzeImage(imageBase64Url) {
   console.log("📸 Analizando imagen con GPT-4o Vision...");
 
-  try {
+  return withRetry(async () => {
     const response = await axios.post(
       `${OPENAI_BASE_URL}/chat/completions`,
       {
@@ -137,6 +175,7 @@ export async function analyzeImage(imageBase64Url) {
           },
         ],
         max_tokens: 150,
+        temperature: 0.5,
       },
       {
         headers: {
@@ -150,10 +189,10 @@ export async function analyzeImage(imageBase64Url) {
     const description = response.data.choices[0]?.message?.content || "una imagen";
     console.log("✅ Descripción de imagen:", description);
     return description;
-  } catch (error) {
+  }).catch((error) => {
     console.error("❌ Error analizando imagen:", error.response?.data || error.message);
     return "una imagen (no pude analizarla en detalle)";
-  }
+  });
 }
 
 export default {
