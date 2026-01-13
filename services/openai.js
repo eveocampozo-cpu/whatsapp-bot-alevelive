@@ -123,7 +123,7 @@ export async function generateResponse(messages, imageUrl = null) {
     const response = await axios.post(
       `${OPENAI_BASE_URL}/chat/completions`,
       {
-        model: "gpt-5.2",
+        model: "gpt-5.1",
         messages: messages,
         max_tokens: 400, // Optimized for WhatsApp (1600 char limit)
         temperature: 0.6, // Slightly lower for more consistent responses
