@@ -155,7 +155,7 @@ export async function analyzeImage(imageBase64Url) {
     const response = await axios.post(
       `${OPENAI_BASE_URL}/chat/completions`,
       {
-        model: "gpt-4o",
+        model: "gpt-5.2-pro",
         messages: [
           {
             role: "user",
