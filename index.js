@@ -1,15 +1,23 @@
 import express from "express";
 import dotenv from "dotenv";
 import twilio from "twilio";
+import path from "path";
+import { fileURLToPath } from "url";
 
 // Services
-import { transcribeAudio, generateResponse } from "./services/openai.js";
-import { downloadMedia, parseIncomingMessage, getMediaByType } from "./services/twilio.js";
+import { transcribeAudio, generateResponse, analyzeImage } from "./services/openai.js";
+import { downloadMedia, parseIncomingMessage, getMediaByType, bufferToBase64Url, sendWhatsAppMessage } from "./services/twilio.js";
 import { loadAndIndexDocument, initializeFromDrive, getDocumentInfo, getDocumentContent, clearAll } from "./services/googleDrive.js";
 import { getSemanticContext, getRAGInfo, clearRAG } from "./services/rag.js";
+import { isNewUser, isWaitingForInterest, markWelcomeSent, markAsActive, resetUser, getUsersSummary, initUserState } from "./services/userState.js";
 
 // Config
-import { buildSystemPrompt, AUDIO_CONTEXT_PREFIX, FALLBACK_RESPONSES } from "./config/systemPrompt.js";
+import { buildSystemPrompt, AUDIO_CONTEXT_PREFIX, IMAGE_CONTEXT_PREFIX, FALLBACK_RESPONSES } from "./config/systemPrompt.js";
+import { buildWelcomeMessage, getWelcomeAudioUrl, getInterestAudioUrl, STREAMER_MESSAGE, INTEREST_QUESTION, INTEREST_DETECTION_PROMPT } from "./config/welcomeMessage.js";
+
+// ES Module dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 dotenv.config();
 
@@ -17,6 +25,17 @@ const app = express();
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// Serve static media files (for audio/images)
+// Serve static media files (for audio/images)
+app.use("/media", (req, res, next) => {
+  console.log(`📂 Acceso a media: ${req.url}`);
+  // Force content type for OGG to ensure Twilio/WhatsApp validity
+  if (req.url.endsWith(".ogg")) {
+    res.setHeader("Content-Type", "audio/ogg");
+  }
+  next();
+}, express.static(path.join(__dirname, "media")));
 
 const { MessagingResponse } = twilio.twiml;
 
@@ -133,6 +152,33 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
+    // Resetear usuario (para pruebas)
+    const resetMatch = message.body?.match(/^RESETEAR\s+USUARIO\s+(\S+)\s+(.+)$/i);
+    if (resetMatch) {
+      const targetUser = resetMatch[1].trim();
+      const password = resetMatch[2].trim();
+      if (password === ADMIN_PASSWORD) {
+        // Handle both formats: +521234567890 or whatsapp:+521234567890
+        const userId = targetUser.startsWith("whatsapp:") ? targetUser : `whatsapp:${targetUser}`;
+        const success = resetUser(userId);
+        reply = success 
+          ? `✅ Usuario ${targetUser} reseteado. Recibirá bienvenida en su próximo mensaje.`
+          : `⚠️ Usuario ${targetUser} no encontrado.`;
+        return sendTwimlResponse(res, reply);
+      }
+    }
+
+    // Ver usuarios
+    const usersMatch = message.body?.match(/^VER\s+USUARIOS\s+(.+)$/i);
+    if (usersMatch) {
+      const password = usersMatch[1].trim();
+      if (password === ADMIN_PASSWORD) {
+        const summary = getUsersSummary();
+        reply = `👥 Usuarios:\n\nTotal: ${summary.total}\n🆕 Nuevos: ${summary.new}\n✅ Activos: ${summary.active}`;
+        return sendTwimlResponse(res, reply);
+      }
+    }
+
     // Get conversation context
     const conversationContext = getConversationContext(message.from);
     
@@ -162,56 +208,190 @@ app.post("/webhook", async (req, res) => {
     }
 
     // ==================================================
-    // PROCESS IMAGE (disabled)
+    // PROCESS IMAGE
     // ==================================================
+    let imageDescription = null;
     if (message.hasImage) {
-      console.log("📸 Imagen detectada, ignorando...");
-      res.status(200).send("");
-      return;
+      console.log("📸 Imagen detectada, analizando...");
+      try {
+        const imageMedia = getMediaByType(message, "image/");
+        if (imageMedia) {
+          const { buffer, contentType } = await downloadMedia(imageMedia.url);
+          const imageBase64Url = bufferToBase64Url(buffer, contentType);
+          imageDescription = await analyzeImage(imageBase64Url);
+          userContent = `${IMAGE_CONTEXT_PREFIX}Descripción: ${imageDescription}${userContent ? `\n\nMensaje del usuario: ${userContent}` : ""}`;
+          console.log("✅ Imagen analizada:", imageDescription.substring(0, 50) + "...");
+        }
+      } catch (imageError) {
+        console.error("❌ Error imagen:", imageError.message);
+        userContent = userContent || "Envié una imagen pero no se pudo procesar.";
+      }
     }
 
     // ==================================================
-    // RAG: SEMANTIC SEARCH FOR RELEVANT CONTEXT
+    // STATE MACHINE FLOW
     // ==================================================
-    if (!userContent.trim()) {
-      userContent = "Hola";
+    
+    // STATE 1: NEW USER - Send welcome sequence
+    if (isNewUser(message.from)) {
+      console.log("🆕 Usuario nuevo detectado, enviando secuencia de bienvenida...");
+      
+      // Build personalized welcome message
+      const welcomeMessage = buildWelcomeMessage(message.profileName);
+      
+      // Mark as WELCOME_SENT (waiting for interest)
+      markWelcomeSent(message.from, message.profileName);
+      
+      // Send welcome message as the TwiML response
+      reply = welcomeMessage;
+      
+      // Add to conversation memory
+      addToConversation(message.from, "user", userContent || "Hola");
+      addToConversation(message.from, "assistant", welcomeMessage);
+      
+      console.log("✅ Bienvenida enviada, iniciando secuencia de mensajes...");
+      
+      // Helper function for delays
+      const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+      
+      // Send sequence in background (don't await - let TwiML response go first)
+      const userTo = message.from; // Capture for closure
+      const audioUrl = getWelcomeAudioUrl();
+      
+      (async () => {
+        try {
+          // Wait 3s, then send streamer message
+          console.log("⏳ Esperando 3s para enviar mensaje streamer...");
+          await delay(3000);
+          await sendWhatsAppMessage(userTo, STREAMER_MESSAGE);
+          console.log("💬 [1/3] Mensaje streamer enviado");
+          
+          // Wait 3s, then send audio
+          console.log("⏳ Esperando 3s para enviar audio...");
+          await delay(3000);
+          if (audioUrl) {
+            console.log("🔊 Enviando audio:", audioUrl);
+            await sendWhatsAppMessage(userTo, "", [audioUrl]);
+            console.log("🎵 [2/3] Audio de bienvenida enviado");
+          } else {
+            console.log("⚠️ No hay BASE_URL configurada, no se envía audio");
+          }
+          
+          // Wait 3s, then send interest question
+          console.log("⏳ Esperando 3s para enviar pregunta...");
+          await delay(3000);
+          await sendWhatsAppMessage(userTo, INTEREST_QUESTION);
+          console.log("❓ [3/3] Pregunta de interés enviada");
+          
+          console.log("✅ Secuencia completa para:", userTo);
+          
+        } catch (err) {
+          console.error("❌ Error en secuencia de bienvenida:", err.message);
+        }
+      })();
+      
+    // STATE 2: WAITING FOR INTEREST - Check response and send second audio if interested
+    } else if (isWaitingForInterest(message.from)) {
+      console.log("⏳ Usuario en espera de interés, analizando respuesta con GPT...");
+      
+      // Use GPT to detect interest
+      const interestPrompt = INTEREST_DETECTION_PROMPT.replace("{{MESSAGE}}", userContent);
+      const interestMessages = [{ role: "user", content: interestPrompt }];
+      const interestResponse = await generateResponse(interestMessages, null);
+      const showedInterest = interestResponse.trim().toUpperCase().includes("SI");
+      
+      console.log(`🤖 GPT dice: "${interestResponse.trim()}" → Interés: ${showedInterest}`);
+      
+      if (showedInterest) {
+        console.log("✅ Usuario mostró interés!");
+        
+        // Mark as active with interest flag
+        markAsActive(message.from, true);
+        
+        // Send positive response
+        reply = "¡Súper! 🎉 Te envío un audio explicándote todo el proceso para que puedas empezar!";
+        
+        // Send second audio (3s delay)
+        const interestAudioUrl = getInterestAudioUrl();
+        if (interestAudioUrl) {
+          setTimeout(async () => {
+            try {
+              await sendWhatsAppMessage(message.from, "", [interestAudioUrl]);
+              console.log("🎵 Audio de interés enviado");
+            } catch (err) {
+              console.error("❌ Error enviando audio de interés:", err.message);
+            }
+          }, 3000);
+        }
+        
+      } else {
+        console.log("🤔 Usuario no mostró interés directo, usando RAG...");
+        
+        // Mark as active without interest flag
+        markAsActive(message.from, false);
+        
+        // Use RAG to respond naturally to whatever they said
+        const semanticContext = await getSemanticContext(userContent, 3);
+        const docContent = getDocumentContent();
+        const systemPrompt = buildSystemPrompt(semanticContext, docContent);
+        
+        const messages = [
+          { role: "system", content: systemPrompt },
+          ...conversationContext.messages,
+          { role: "user", content: userContent }
+        ];
+        
+        reply = await generateResponse(messages, null);
+      }
+      
+      addToConversation(message.from, "user", userContent);
+      addToConversation(message.from, "assistant", reply);
+      
+    // STATE 3: ACTIVE USER - Use RAG normally
+    } else {
+      // ==================================================
+      // RAG: SEMANTIC SEARCH FOR RELEVANT CONTEXT
+      // ==================================================
+      if (!userContent.trim()) {
+        userContent = "Hola";
+      }
+
+      console.log("🔍 Buscando contexto relevante con RAG...");
+      
+      // Get semantically relevant context from vector store
+      const semanticContext = await getSemanticContext(userContent, 3);
+      
+      // Get full document content for direct instructions
+      const docContent = getDocumentContent();
+      
+      console.log("📚 Contexto RAG:", semanticContext ? `${semanticContext.length} chars` : "ninguno");
+      console.log("📄 Documento:", docContent ? `${docContent.length} chars` : "vacío");
+      
+      // Build prompt with semantic context + document content
+      const systemPrompt = buildSystemPrompt(semanticContext, docContent);
+
+      // ==================================================
+      // GENERATE AI RESPONSE
+      // ==================================================
+      console.log("🤖 Generando respuesta...");
+
+      addToConversation(message.from, "user", userContent);
+
+      const messages = [
+        { role: "system", content: systemPrompt },
+        ...conversationContext.messages
+      ];
+
+      reply = await generateResponse(messages, null);
+      
+      addToConversation(message.from, "assistant", reply);
+      
+      if (reply.length > 1500) {
+        reply = reply.substring(0, 1497) + "...";
+      }
+
+      console.log("✅ Respuesta:", reply.substring(0, 100) + "...");
     }
-
-    console.log("🔍 Buscando contexto relevante con RAG...");
-    
-    // Get semantically relevant context from vector store
-    const semanticContext = await getSemanticContext(userContent, 3);
-    
-    // Get full document content for direct instructions
-    const docContent = getDocumentContent();
-    
-    console.log("📚 Contexto RAG:", semanticContext ? `${semanticContext.length} chars` : "ninguno");
-    console.log("📄 Documento:", docContent ? `${docContent.length} chars` : "vacío");
-    
-    // Build prompt with semantic context + document content
-    const systemPrompt = buildSystemPrompt(semanticContext, docContent);
-
-    // ==================================================
-    // GENERATE AI RESPONSE
-    // ==================================================
-    console.log("🤖 Generando respuesta...");
-
-    addToConversation(message.from, "user", userContent);
-
-    const messages = [
-      { role: "system", content: systemPrompt },
-      ...conversationContext.messages
-    ];
-
-    reply = await generateResponse(messages, null);
-    
-    addToConversation(message.from, "assistant", reply);
-    
-    if (reply.length > 1500) {
-      reply = reply.substring(0, 1497) + "...";
-    }
-
-    console.log("✅ Respuesta:", reply.substring(0, 100) + "...");
 
   } catch (error) {
     console.error("❌ Error:", error.message);
@@ -308,27 +488,35 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, async () => {
   console.log("==================================================");
-  console.log("🚀 AleveLive WhatsApp AI (RAG + Embeddings)");
+  console.log("🚀 AleveLive WhatsApp AI (RAG + Welcome Flow)");
   console.log("==================================================");
   console.log("📱 Webhook: POST /webhook");
+  console.log("📁 Media: GET /media/*");
   console.log("💚 Health: GET /health");
   console.log("🔍 Debug: POST /debug/search");
   console.log("🔐 Admin: POST /admin/refresh, /admin/clear");
   console.log("==================================================");
   console.log("");
   console.log("📋 Comandos WhatsApp (admin):");
-  console.log("   ACTUALIZAR RAG [password] - Reindexar desde Drive");
-  console.log("   LIMPIAR RAG [password]    - Limpiar índice");
-  console.log("   ESTADO RAG [password]     - Ver estado");
+  console.log("   ACTUALIZAR RAG [password]           - Reindexar desde Drive");
+  console.log("   LIMPIAR RAG [password]              - Limpiar índice");
+  console.log("   ESTADO RAG [password]               - Ver estado RAG");
+  console.log("   RESETEAR USUARIO [numero] [password] - Resetear usuario");
+  console.log("   VER USUARIOS [password]             - Ver resumen usuarios");
   console.log("==================================================");
+  
+  // Initialize user state service
+  initUserState();
   
   // Initialize RAG from Google Docs
   await initializeFromDrive();
   
   const ragInfo = getRAGInfo();
+  const usersSummary = getUsersSummary();
   console.log("");
   console.log(ragInfo.indexed 
     ? `✅ RAG listo: ${ragInfo.chunks} chunks indexados`
     : "⚠️ RAG vacío - usa ACTUALIZAR RAG para indexar");
+  console.log(`👥 Usuarios: ${usersSummary.total} total (${usersSummary.active} activos)`);
   console.log("==================================================");
 });

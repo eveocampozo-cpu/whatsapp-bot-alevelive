@@ -107,9 +107,74 @@ export function bufferToBase64Url(buffer, contentType) {
   return `data:${contentType};base64,${base64}`;
 }
 
+/**
+ * Send WhatsApp message via Twilio API (for sending additional messages/media)
+ * @param {string} to - Recipient WhatsApp number (e.g., "whatsapp:+521234567890")
+ * @param {string} body - Message text (can be empty if only sending media)
+ * @param {string[]} mediaUrls - Optional array of public media URLs
+ * @returns {Promise<Object>} Twilio message response
+ */
+export async function sendWhatsAppMessage(to, body, mediaUrls = []) {
+  const accountSid = getAccountSid();
+  const authToken = getAuthToken();
+  let fromNumber = process.env.TWILIO_WHATSAPP_NUMBER;
+
+  if (!accountSid || !authToken || !fromNumber) {
+    throw new Error("Credenciales de Twilio no configuradas");
+  }
+
+  // Ensure from number has whatsapp: prefix
+  if (!fromNumber.startsWith("whatsapp:")) {
+    fromNumber = `whatsapp:${fromNumber}`;
+  }
+
+  console.log(`📤 Enviando mensaje a ${to}...`);
+  console.log(`📤 Desde: ${fromNumber}`);
+
+  try {
+    // Build form data manually for proper serialization
+    const params = new URLSearchParams();
+    params.append("From", fromNumber);
+    params.append("To", to);
+    
+    // Body is required by Twilio, use space if empty
+    params.append("Body", body || " ");
+    
+    // Add each media URL separately (Twilio expects multiple MediaUrl params)
+    if (mediaUrls && mediaUrls.length > 0) {
+      mediaUrls.forEach(url => {
+        params.append("MediaUrl", url);
+      });
+      console.log(`📎 Con media: ${mediaUrls.length} archivo(s)`);
+    }
+
+    const response = await axios.post(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+      params.toString(),
+      {
+        auth: {
+          username: accountSid,
+          password: authToken,
+        },
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        timeout: 30000,
+      }
+    );
+
+    console.log(`✅ Mensaje enviado: ${response.data.sid}`);
+    return response.data;
+  } catch (error) {
+    console.error("❌ Error enviando mensaje:", error.response?.data || error.message);
+    throw error;
+  }
+}
+
 export default {
   downloadMedia,
   parseIncomingMessage,
   getMediaByType,
   bufferToBase64Url,
+  sendWhatsAppMessage,
 };
