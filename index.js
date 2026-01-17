@@ -9,11 +9,11 @@ import { transcribeAudio, generateResponse, analyzeImage } from "./services/open
 import { downloadMedia, parseIncomingMessage, getMediaByType, bufferToBase64Url, sendWhatsAppMessage } from "./services/twilio.js";
 import { loadAndIndexDocument, initializeFromDrive, getDocumentInfo, getDocumentContent, clearAll } from "./services/googleDrive.js";
 import { getSemanticContext, getRAGInfo, clearRAG } from "./services/rag.js";
-import { isNewUser, isWaitingForInterest, markWelcomeSent, markAsActive, resetUser, getUsersSummary, initUserState } from "./services/userState.js";
+import { isNewUser, isWaitingForInterest, isWaitingForLive, isWaitingForQRLink, markWelcomeSent, markWaitingForLive, markWaitingForQRLink, markCompleted, markAsActive, resetUser, getUsersSummary, initUserState } from "./services/userState.js";
 
 // Config
 import { buildSystemPrompt, AUDIO_CONTEXT_PREFIX, IMAGE_CONTEXT_PREFIX, FALLBACK_RESPONSES } from "./config/systemPrompt.js";
-import { buildWelcomeMessage, getWelcomeAudioUrl, getInterestAudioUrl, STREAMER_MESSAGE, INTEREST_QUESTION, INTEREST_DETECTION_PROMPT } from "./config/welcomeMessage.js";
+import { buildWelcomeMessage, getWelcomeAudioUrl, getInterestAudioUrl, getInterestVideoUrl, getQRImageUrl, getQRStepsImageUrl, STREAMER_MESSAGE, INTEREST_QUESTION, INTEREST_DETECTION_PROMPT, LIVE_CONFIRMATION_PROMPT, QR_LINK_CONFIRMATION_PROMPT } from "./config/welcomeMessage.js";
 
 // ES Module dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -305,19 +305,43 @@ app.post("/webhook", async (req, res) => {
       if (showedInterest) {
         console.log("✅ Usuario mostró interés!");
         
-        // Mark as active with interest flag
-        markAsActive(message.from, true);
+        // Mark as waiting for live confirmation
+        markWaitingForLive(message.from);
         
         // Send positive response
         reply = "¡Súper! 🎉 Te envío un audio explicándote todo el proceso para que puedas empezar!";
         
-        // Send second audio (3s delay)
+        // Send second audio and then video in sequence
         const interestAudioUrl = getInterestAudioUrl();
+        const interestVideoUrl = getInterestVideoUrl();
+        
         if (interestAudioUrl) {
           setTimeout(async () => {
             try {
               await sendWhatsAppMessage(message.from, "", [interestAudioUrl]);
               console.log("🎵 Audio de interés enviado");
+              
+              // Send video 5 seconds after audio
+              if (interestVideoUrl) {
+                setTimeout(async () => {
+                  try {
+                    await sendWhatsAppMessage(message.from, "👆 Aquí te dejo un video con los pasos para que puedas comenzar! 🎬", [interestVideoUrl]);
+                    console.log("🎬 Video de pasos enviado");
+                    
+                    // Send live scheduling question 5 seconds after video
+                    setTimeout(async () => {
+                      try {
+                        await sendWhatsAppMessage(message.from, "Cuando te quedaría fácil hacer este primer live?");
+                        console.log("📅 Pregunta de horario enviada");
+                      } catch (err) {
+                        console.error("❌ Error enviando pregunta de horario:", err.message);
+                      }
+                    }, 5000);
+                  } catch (err) {
+                    console.error("❌ Error enviando video de pasos:", err.message);
+                  }
+                }, 5000);
+              }
             } catch (err) {
               console.error("❌ Error enviando audio de interés:", err.message);
             }
@@ -347,7 +371,130 @@ app.post("/webhook", async (req, res) => {
       addToConversation(message.from, "user", userContent);
       addToConversation(message.from, "assistant", reply);
       
-    // STATE 3: ACTIVE USER - Use RAG normally
+    // STATE 3: WAITING FOR LIVE CONFIRMATION
+    } else if (isWaitingForLive(message.from)) {
+      console.log("⏳ Usuario esperando confirmación de live...");
+      
+      // Use GPT to detect if user confirmed they did the live
+      const livePrompt = LIVE_CONFIRMATION_PROMPT.replace("{{MESSAGE}}", userContent);
+      const liveMessages = [{ role: "user", content: livePrompt }];
+      const liveResponse = await generateResponse(liveMessages, null);
+      const confirmedLive = liveResponse.trim().toUpperCase().includes("SI");
+      
+      console.log(`🤖 GPT dice: "${liveResponse.trim()}" → Confirmó live: ${confirmedLive}`);
+      
+      if (confirmedLive) {
+        console.log("✅ Usuario confirmó que hizo el live!");
+        
+        // Mark as waiting for QR link
+        markWaitingForQRLink(message.from);
+        
+        // Send QR registration message
+        reply = "Ya lo que sigue es hacer el registro con la agencia a traves de un QR y ya te envio las instrucciones☺️";
+        
+        // Send QR images in sequence
+        const qrImageUrl = getQRImageUrl();
+        const qrStepsImageUrl = getQRStepsImageUrl();
+        
+        setTimeout(async () => {
+          try {
+            // Send first QR image
+            if (qrImageUrl) {
+              await sendWhatsAppMessage(message.from, "", [qrImageUrl]);
+              console.log("📱 Imagen QR enviada");
+            }
+            
+            // Send second image (steps) after 3 seconds
+            setTimeout(async () => {
+              try {
+                if (qrStepsImageUrl) {
+                  await sendWhatsAppMessage(message.from, "", [qrStepsImageUrl]);
+                  console.log("📋 Imagen pasos QR enviada");
+                }
+                
+                // Send follow-up message after 3 seconds
+                setTimeout(async () => {
+                  try {
+                    await sendWhatsAppMessage(message.from, "Me vas contando si te funciona o si tienes alguna dificultad💖");
+                    console.log("💬 Mensaje de seguimiento QR enviado");
+                  } catch (err) {
+                    console.error("❌ Error enviando mensaje seguimiento:", err.message);
+                  }
+                }, 3000);
+              } catch (err) {
+                console.error("❌ Error enviando imagen pasos QR:", err.message);
+              }
+            }, 3000);
+          } catch (err) {
+            console.error("❌ Error enviando imagen QR:", err.message);
+          }
+        }, 3000);
+        
+      } else {
+        console.log("🤔 Usuario no confirmó live, usando RAG...");
+        
+        // Use RAG to respond to their question/message
+        const semanticContext = await getSemanticContext(userContent, 3);
+        const docContent = getDocumentContent();
+        const systemPrompt = buildSystemPrompt(semanticContext, docContent);
+        
+        const messages = [
+          { role: "system", content: systemPrompt },
+          ...conversationContext.messages,
+          { role: "user", content: userContent }
+        ];
+        
+        reply = await generateResponse(messages, null);
+      }
+      
+      addToConversation(message.from, "user", userContent);
+      addToConversation(message.from, "assistant", reply);
+      
+    // STATE 4: WAITING FOR QR LINK CONFIRMATION
+    } else if (isWaitingForQRLink(message.from)) {
+      console.log("⏳ Usuario esperando confirmación de vinculación QR...");
+      
+      // Use GPT to detect if user confirmed they linked via QR
+      const qrPrompt = QR_LINK_CONFIRMATION_PROMPT.replace("{{MESSAGE}}", userContent);
+      const qrMessages = [{ role: "user", content: qrPrompt }];
+      const qrResponse = await generateResponse(qrMessages, null);
+      const confirmedQR = qrResponse.trim().toUpperCase().includes("SI");
+      
+      console.log(`🤖 GPT dice: "${qrResponse.trim()}" → Confirmó QR: ${confirmedQR}`);
+      
+      if (confirmedQR) {
+        console.log("✅ Usuario confirmó vinculación QR!");
+        
+        // Mark as completed
+        markCompleted(message.from);
+        
+        // Get user's name for personalized message
+        const userName = conversationContext.userName || "amiga";
+        
+        // Send completion message
+        reply = `Perfecto ${userName}! Ya nosotros enviamos a revision la solicitud con TIKTOK y entre hoy y mañana podemos aceptar la invitacion☺️`;
+        
+      } else {
+        console.log("🤔 Usuario no confirmó QR, usando RAG...");
+        
+        // Use RAG to respond to their question/message
+        const semanticContext = await getSemanticContext(userContent, 3);
+        const docContent = getDocumentContent();
+        const systemPrompt = buildSystemPrompt(semanticContext, docContent);
+        
+        const messages = [
+          { role: "system", content: systemPrompt },
+          ...conversationContext.messages,
+          { role: "user", content: userContent }
+        ];
+        
+        reply = await generateResponse(messages, null);
+      }
+      
+      addToConversation(message.from, "user", userContent);
+      addToConversation(message.from, "assistant", reply);
+      
+    // STATE 5: COMPLETED or ACTIVE USER - Use RAG normally
     } else {
       // ==================================================
       // RAG: SEMANTIC SEARCH FOR RELEVANT CONTEXT

@@ -5,7 +5,10 @@
  * States:
  * - NEW: First contact, never received welcome
  * - WELCOME_SENT: Received welcome, waiting for interest response
- * - ACTIVE: Already engaged, use RAG normal
+ * - WAITING_LIVE: Showed interest, waiting for live confirmation
+ * - WAITING_QR_LINK: Did live, waiting for QR link confirmation
+ * - COMPLETED: Fully onboarded
+ * - ACTIVE: General conversation (fallback for old users)
  */
 
 import fs from "fs";
@@ -21,6 +24,9 @@ const USERS_FILE = path.join(__dirname, "../data/users.json");
 export const USER_STATES = {
   NEW: "NEW",
   WELCOME_SENT: "WELCOME_SENT",
+  WAITING_LIVE: "WAITING_LIVE",
+  WAITING_QR_LINK: "WAITING_QR_LINK",
+  COMPLETED: "COMPLETED",
   ACTIVE: "ACTIVE"
 };
 
@@ -83,6 +89,27 @@ export function isWaitingForInterest(userId) {
 }
 
 /**
+ * Check if user is waiting for live confirmation
+ */
+export function isWaitingForLive(userId) {
+  return getUserState(userId) === USER_STATES.WAITING_LIVE;
+}
+
+/**
+ * Check if user is waiting for QR link confirmation
+ */
+export function isWaitingForQRLink(userId) {
+  return getUserState(userId) === USER_STATES.WAITING_QR_LINK;
+}
+
+/**
+ * Check if user is completed (fully onboarded)
+ */
+export function isCompleted(userId) {
+  return getUserState(userId) === USER_STATES.COMPLETED;
+}
+
+/**
  * Check if user is active (use RAG)
  */
 export function isActiveUser(userId) {
@@ -121,7 +148,55 @@ export function markWelcomeSent(userId, name = null) {
 }
 
 /**
- * Mark user as active (after showing interest or any response)
+ * Mark user as waiting for live confirmation (after showing interest)
+ */
+export function markWaitingForLive(userId) {
+  const existing = usersCache[userId] || {};
+  
+  usersCache[userId] = {
+    ...existing,
+    state: USER_STATES.WAITING_LIVE,
+    interestedAt: new Date().toISOString()
+  };
+  
+  saveUsers();
+  console.log(`✅ Usuario en WAITING_LIVE: ${userId}`);
+}
+
+/**
+ * Mark user as waiting for QR link confirmation (after completing live)
+ */
+export function markWaitingForQRLink(userId) {
+  const existing = usersCache[userId] || {};
+  
+  usersCache[userId] = {
+    ...existing,
+    state: USER_STATES.WAITING_QR_LINK,
+    liveCompletedAt: new Date().toISOString()
+  };
+  
+  saveUsers();
+  console.log(`✅ Usuario en WAITING_QR_LINK: ${userId}`);
+}
+
+/**
+ * Mark user as completed (fully onboarded)
+ */
+export function markCompleted(userId) {
+  const existing = usersCache[userId] || {};
+  
+  usersCache[userId] = {
+    ...existing,
+    state: USER_STATES.COMPLETED,
+    completedAt: new Date().toISOString()
+  };
+  
+  saveUsers();
+  console.log(`✅ Usuario COMPLETED: ${userId}`);
+}
+
+/**
+ * Mark user as active (general conversation state)
  */
 export function markAsActive(userId, showedInterest = false) {
   const existing = usersCache[userId] || {};
@@ -133,7 +208,7 @@ export function markAsActive(userId, showedInterest = false) {
   };
   
   saveUsers();
-  console.log(`✅ Usuario ACTIVE: ${userId} (interés: ${showedInterest})`);
+  console.log(`✅ Usuario ACTIVE: ${userId} (interés: ${showedInterest})`)
 }
 
 /**
@@ -181,9 +256,15 @@ export default {
   getUserState,
   isNewUser,
   isWaitingForInterest,
+  isWaitingForLive,
+  isWaitingForQRLink,
+  isCompleted,
   isActiveUser,
   getUserData,
   markWelcomeSent,
+  markWaitingForLive,
+  markWaitingForQRLink,
+  markCompleted,
   markAsActive,
   resetUser,
   getUsersSummary,
