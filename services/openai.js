@@ -36,9 +36,21 @@ async function withRetry(fn, retries = MAX_RETRIES, delay = BASE_DELAY_MS) {
       return await fn();
     } catch (error) {
       lastError = error;
+      const status = error.response?.status;
       
-      // Don't retry on 4xx errors (client errors)
-      if (error.response?.status >= 400 && error.response?.status < 500) {
+      // 429 = Rate limiting, should retry with longer delay
+      if (status === 429) {
+        if (attempt < retries) {
+          // For rate limiting, use longer delay (exponential backoff starting at 3s)
+          const waitTime = 3000 * Math.pow(2, attempt - 1);
+          console.log(`⚠️ Rate limit (429). Esperando ${waitTime/1000}s antes de reintentar (${attempt}/${retries})...`);
+          await sleep(waitTime);
+          continue;
+        }
+      }
+      
+      // Don't retry on other 4xx errors (client errors) except 429
+      if (status >= 400 && status < 500 && status !== 429) {
         throw error;
       }
       
@@ -123,10 +135,10 @@ export async function generateResponse(messages, imageUrl = null) {
     const response = await axios.post(
       `${OPENAI_BASE_URL}/chat/completions`,
       {
-        model: "gpt-4o",
+        model: "gpt-4o", // Using mini for higher rate limits and lower cost
         messages: messages,
-        max_tokens: 400, // Optimized for WhatsApp (1600 char limit)
-        temperature: 0.6, // Slightly lower for more consistent responses
+        max_tokens: 350, // Balanced for complete messages but not too long
+        temperature: 0.5, // Lower for more consistent Evelin personality
       },
       {
         headers: {

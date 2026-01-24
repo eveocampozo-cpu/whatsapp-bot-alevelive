@@ -78,11 +78,17 @@ export function parseIncomingMessage(body) {
     profileName: body.ProfileName,
     waId: body.WaId,
     
+    // Reply context (available in Twilio production, may be missing in sandbox)
+    isReply: !!body.OriginalRepliedMessageSid,
+    originalRepliedMessageSid: body.OriginalRepliedMessageSid || null,
+    originalRepliedMessageSender: body.OriginalRepliedMessageSender || null,
+    
     // Helper flags
     hasMedia: numMedia > 0,
     hasAudio: mediaItems.some(m => m.contentType?.startsWith("audio/")),
     hasImage: mediaItems.some(m => m.contentType?.startsWith("image/")),
     hasVideo: mediaItems.some(m => m.contentType?.startsWith("video/")),
+    hasSticker: mediaItems.some(m => m.contentType?.includes("webp")), // WhatsApp stickers are webp
   };
 }
 
